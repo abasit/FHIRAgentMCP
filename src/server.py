@@ -1,4 +1,6 @@
 import argparse
+import logging
+
 import uvicorn
 
 from a2a.server.apps import A2AStarletteApplication
@@ -12,34 +14,36 @@ from a2a.types import (
 
 from executor import Executor
 
+# Configure logging
+logging.basicConfig(level=logging.WARNING)
+
+logging.getLogger("mcp_purple_agent").setLevel(logging.DEBUG)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the A2A agent.")
+    parser = argparse.ArgumentParser(description="Run the MCP-based purple agent.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
-    parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
+    parser.add_argument("--port", type=int, default=9002, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="URL to advertise in the agent card")
     args = parser.parse_args()
 
-    # Fill in your agent card
-    # See: https://a2a-protocol.org/latest/tutorials/python/3-agent-skills-and-card/
-    
     skill = AgentSkill(
-        id="",
-        name="",
-        description="",
-        tags=[],
+        id="mcp_task_fulfillment",
+        name="MCP Task Fulfillment",
+        description="Handles user requests and completes tasks using FHIR MCP tools",
+        tags=["mcp", "fhir", "medical"],
         examples=[]
     )
 
     agent_card = AgentCard(
-        name="",
-        description="",
+        name="MCP Based FHIR Purple Agent",
+        description="Agent that answers medical questions using FHIR data via MCP",
         url=args.card_url or f"http://{args.host}:{args.port}/",
-        version='1.0.0',
-        default_input_modes=['text'],
-        default_output_modes=['text'],
+        version="1.0.0",
+        default_input_modes=["text"],
+        default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),
-        skills=[skill]
+        skills=[skill],
     )
 
     request_handler = DefaultRequestHandler(
@@ -50,6 +54,10 @@ def main():
         agent_card=agent_card,
         http_handler=request_handler,
     )
+
+    logger = logging.getLogger("mcp_purple_agent")
+    logger.info(f"Starting MCP purple agent at {args.host}:{args.port}")
+
     uvicorn.run(server.build(), host=args.host, port=args.port)
 
 
