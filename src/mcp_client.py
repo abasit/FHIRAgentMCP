@@ -26,7 +26,7 @@ class MCPClient:
         self._get_session_id = None
 
     async def connect(self) -> ClientSession:
-        """Connect to the MCP server."""
+        """Connect to the MCP server and initialize session."""
         if self.session:
             return self.session
 
@@ -56,7 +56,7 @@ class MCPClient:
             raise
 
     async def close(self) -> None:
-        """Close the MCP connection."""
+        """Close the MCP connection and cleanup resources."""
         if self._stack:
             logger.debug(f"Closing MCP connection to {self.url}")
             try:

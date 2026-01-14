@@ -1,14 +1,14 @@
 """
 MCP-based purple agent for FHIR evaluation.
 
-This agent connects to an MCP server to access FHIR tools and answers
-medical questions by iteratively calling tools and reasoning over results.
+Connects to an MCP server to access FHIR tools and answers medical questions
+by iteratively calling tools and reasoning over results.
 """
 
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Optional
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TextPart
@@ -20,9 +20,12 @@ from mcp_client import MCPClient
 
 logger = logging.getLogger("mcp_purple_agent")
 
-SYSTEM_PROMPT = """You are a helpful assistant that uses MCP tools to answer questions.
+SYSTEM_PROMPT = """You are a helpful AI assistant that can complete tasks using available tools.
 
-You have access to tools via an MCP server. Use them to retrieve information before answering.
+Use the available MCP tools to retrieve information before answering.
+Provide clear, accurate answers based on the data you retrieve.
+If you cannot find information, state this clearly rather than guessing.
+Do not repeat the same action multiple times.
 
 Respond in JSON format wrapped in <json>...</json> tags:
 
@@ -40,6 +43,7 @@ IMPORTANT: Your final answer must start with 'The final answer is:'
 """
 
 MAX_ITERATIONS = 10
+DEFAULT_MODEL = "openai/gpt-4o"
 
 
 class MCPContextState(BaseModel):
@@ -48,8 +52,8 @@ class MCPContextState(BaseModel):
 
     url: str
     client: Any  # MCPClient
-    messages: List[Dict[str, str]] = Field(default_factory=list)
-    tools_index: Set[str] = Field(default_factory=set)
+    messages: list[dict[str, str]] = Field(default_factory=list)
+    tools_index: set[str] = Field(default_factory=set)
     session_id: Optional[str] = None
 
 
@@ -57,7 +61,7 @@ class Agent:
     """Purple agent that uses MCP tools to answer questions."""
 
     def __init__(self):
-        self.ctx_id_to_state: Dict[str, MCPContextState] = {}
+        self.ctx_id_to_state: dict[str, MCPContextState] = {}
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         """Process message and respond using MCP tools."""
@@ -67,7 +71,6 @@ class Agent:
         logger.info(f"[{context_id}] Received input ({len(user_input)} chars)")
         logger.debug(f"[{context_id}] Input: {user_input[:500]}...")
 
-        # Setup MCP connection
         try:
             state = await self._ensure_state(context_id, user_input)
             logger.info(f"[{context_id}] Connected to MCP at {state.url}")
@@ -79,18 +82,15 @@ class Agent:
             )
             return
 
-        # Add user message
         state.messages.append({"role": "user", "content": user_input})
 
-        # Iterative tool calling loop
         assistant_content = ""
         for i in range(MAX_ITERATIONS):
             logger.info(f"[{context_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
-            # Get LLM response
             response = completion(
                 messages=state.messages,
-                model="openai/gpt-4o",
+                model=DEFAULT_MODEL,
                 temperature=0.0,
                 top_p=0,
                 seed=0,
@@ -100,7 +100,6 @@ class Agent:
 
             logger.debug(f"[{context_id}] LLM response: {assistant_content[:300]}...")
 
-            # Parse actions from response
             try:
                 actions = self._parse_actions(assistant_content)
                 actions = self._filter_actions(actions, state.tools_index)
@@ -109,17 +108,14 @@ class Agent:
                 logger.warning(f"[{context_id}] Failed to parse response: {e}")
                 break
 
-            # Check for final response
             if any(a.get("name") == "response" for a in actions):
                 logger.info(f"[{context_id}] Got final response")
                 break
 
-            # No actions to execute
             if not actions:
                 logger.warning(f"[{context_id}] No actionable tool calls found")
                 break
 
-            # Execute tool calls
             for action in actions:
                 name = action.get("name")
                 if name == "response":
@@ -157,13 +153,11 @@ class Agent:
         if not mcp_url:
             raise ValueError("No MCP URL found in prompt")
 
-        # Check if we need to reconnect (different URL)
         state = self.ctx_id_to_state.get(context_id)
         if state and state.url != mcp_url:
             await self._teardown_context(context_id)
             state = None
 
-        # Create new connection if needed
         if not state:
             client = MCPClient(mcp_url)
             await client.connect()
@@ -212,21 +206,18 @@ class Agent:
         return None
 
     @staticmethod
-    def _parse_actions(response_text: str) -> List[Dict[str, Any]]:
+    def _parse_actions(response_text: str) -> list[dict[str, Any]]:
         """Parse JSON actions from LLM response."""
         json_str = None
 
-        # Try <json>...</json> tags first
         match = re.search(r'<json>\s*(.*?)\s*</json>', response_text, re.DOTALL)
         if match:
             json_str = match.group(1)
         else:
-            # Try ```json...``` blocks
             match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
             if match:
                 json_str = match.group(1)
             else:
-                # Try generic code blocks
                 match = re.search(r'```\s*(.*?)\s*```', response_text, re.DOTALL)
                 if match:
                     json_str = match.group(1)
@@ -264,7 +255,7 @@ class Agent:
         except Exception:
             return str(result)
 
-    def _filter_actions(self, actions: List[Dict[str, Any]], valid_tools: Set[str]) -> List[Dict[str, Any]]:
+    def _filter_actions(self, actions: list[dict[str, Any]], valid_tools: set[str]) -> list[dict[str, Any]]:
         """Filter actions to only include valid tools."""
         filtered = []
         for action in actions:
