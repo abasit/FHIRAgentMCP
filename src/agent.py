@@ -43,7 +43,7 @@ IMPORTANT: Your final answer must start with 'The final answer is:'
 """
 
 MAX_ITERATIONS = 10
-DEFAULT_MODEL = "openai/gpt-4o"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 
 class MCPContextState(BaseModel):
