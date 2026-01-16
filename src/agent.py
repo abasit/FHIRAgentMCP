@@ -68,12 +68,12 @@ class Agent:
         user_input = get_message_text(message)
         context_id = message.context_id
 
-        logger.info(f"[{context_id}] Received input ({len(user_input)} chars)")
+        logger.info(f"[{context_id}] Received task.")
         logger.debug(f"[{context_id}] Input: {user_input[:500]}...")
 
         try:
             state = await self._ensure_state(context_id, user_input)
-            logger.info(f"[{context_id}] Connected to MCP at {state.url}")
+            logger.debug(f"[{context_id}] Connected to MCP at {state.url}")
         except Exception as e:
             logger.error(f"[{context_id}] Setup error: {e}")
             await updater.add_artifact(
@@ -86,7 +86,7 @@ class Agent:
 
         assistant_content = ""
         for i in range(MAX_ITERATIONS):
-            logger.info(f"[{context_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
+            logger.debug(f"[{context_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
             response = completion(
                 messages=state.messages,
@@ -103,7 +103,7 @@ class Agent:
             try:
                 actions = self._parse_actions(assistant_content)
                 actions = self._filter_actions(actions, state.tools_index)
-                logger.info(f"[{context_id}] Actions: {[a.get('name') for a in actions]}")
+                logger.debug(f"[{context_id}] Actions: {[a.get('name') for a in actions]}")
             except Exception as e:
                 logger.warning(f"[{context_id}] Failed to parse response: {e}")
                 break
@@ -122,7 +122,7 @@ class Agent:
                     break
 
                 kwargs = action.get("kwargs", {})
-                logger.info(f"[{context_id}] Calling tool: {name}")
+                logger.debug(f"[{context_id}] Calling tool: {name}")
                 logger.debug(f"[{context_id}] Tool args: {kwargs}")
 
                 try:
@@ -140,7 +140,7 @@ class Agent:
                         "content": f"Tool `{name}` error: {e}"
                     })
 
-        logger.info(f"[{context_id}] Completed, response length: {len(assistant_content)}")
+        logger.info(f"[{context_id}] Completed task.")
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
