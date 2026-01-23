@@ -51,7 +51,7 @@ class MCPContextState(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
     url: str
-    client: Any  # MCPClient
+    client: MCPClient
     messages: list[dict[str, str]] = Field(default_factory=list)
     tools_index: set[str] = Field(default_factory=set)
     session_id: Optional[str] = None
@@ -66,16 +66,16 @@ class Agent:
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         """Process message and respond using MCP tools."""
         user_input = get_message_text(message)
-        context_id = message.context_id
+        ctx_id = message.context_id
 
-        logger.info(f"[{context_id}] Received task.")
-        logger.debug(f"[{context_id}] Input: {user_input[:500]}...")
+        logger.info(f"[{ctx_id}] Received task")
+        logger.debug(f"[{ctx_id}] Input: {user_input[:500]}...")
 
         try:
-            state = await self._ensure_state(context_id, user_input)
-            logger.debug(f"[{context_id}] Connected to MCP at {state.url}")
+            state = await self._ensure_state(ctx_id, user_input)
+            logger.debug(f"[{ctx_id}] Connected to MCP at {state.url}")
         except Exception as e:
-            logger.error(f"[{context_id}] Setup error: {e}")
+            logger.error(f"[{ctx_id}] Setup error: {e}")
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text=f"Error: {str(e)}"))],
                 name="Error",
@@ -86,7 +86,7 @@ class Agent:
 
         assistant_content = ""
         for i in range(MAX_ITERATIONS):
-            logger.debug(f"[{context_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
+            logger.debug(f"[{ctx_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
             response = completion(
                 messages=state.messages,
@@ -98,64 +98,84 @@ class Agent:
             assistant_content = response.choices[0].message.content or ""
             state.messages.append({"role": "assistant", "content": assistant_content})
 
-            logger.debug(f"[{context_id}] LLM response: {assistant_content[:300]}...")
+            logger.debug(f"[{ctx_id}] LLM response: {assistant_content[:300]}...")
 
             try:
-                actions = self._parse_actions(assistant_content)
-                actions = self._filter_actions(actions, state.tools_index)
-                logger.debug(f"[{context_id}] Actions: {[a.get('name') for a in actions]}")
+                action = self._parse_action(assistant_content)
+                logger.debug(f"[{ctx_id}] Action: {action.get('name') if action else None}")
             except Exception as e:
-                logger.warning(f"[{context_id}] Failed to parse response: {e}")
+                logger.warning(f"[{ctx_id}] Failed to parse response: {e}")
                 break
 
-            if any(a.get("name") == "response" for a in actions):
-                logger.info(f"[{context_id}] Got final response")
+            if not action:
+                logger.warning(f"[{ctx_id}] No action found in response")
                 break
 
-            if not actions:
-                logger.warning(f"[{context_id}] No actionable tool calls found")
+            name = action.get("name")
+            kwargs = action.get("kwargs", {})
+
+            # Final response
+            if name == "response":
+                logger.debug(f"[{ctx_id}] Got final response")
                 break
 
-            for action in actions:
-                name = action.get("name")
-                if name == "response":
-                    break
+            # Unknown tool
+            if name not in state.tools_index:
+                logger.warning(f"[{ctx_id}] Unknown tool: {name}")
+                state.messages.append({
+                    "role": "user",
+                    "content": f"Error: Unknown tool '{name}'. Available tools: {sorted(state.tools_index)}"
+                })
+                continue
 
-                kwargs = action.get("kwargs", {})
-                logger.debug(f"[{context_id}] Calling tool: {name}")
-                logger.debug(f"[{context_id}] Tool args: {kwargs}")
+            # Call tool
+            logger.debug(f"[{ctx_id}] Calling tool: {name}, args: {kwargs}")
+            try:
+                result = await state.client.call_tool(name, kwargs)
+                result_text = self._format_tool_result(result)
+                logger.debug(f"[{ctx_id}] Tool result: {result_text[:200]}...")
+                state.messages.append({
+                    "role": "user",
+                    "content": f"Tool `{name}` result:\n{result_text}"
+                })
+            except Exception as e:
+                logger.error(f"[{ctx_id}] Tool {name} failed: {e}")
+                state.messages.append({
+                    "role": "user",
+                    "content": f"Tool `{name}` error: {e}"
+                })
+        else:
+            # Max iterations reached - ask for final answer
+            logger.warning(f"[{ctx_id}] Max iterations reached, requesting final answer")
+            state.messages.append({
+                "role": "user",
+                "content": "You have reached the maximum number of iterations. Please provide your final answer now based on what you have learned."
+            })
+            response = completion(
+                messages=state.messages,
+                model=DEFAULT_MODEL,
+                temperature=0.0,
+                top_p=0,
+                seed=0,
+            )
+            assistant_content = response.choices[0].message.content or ""
 
-                try:
-                    result = await state.client.call_tool(name, kwargs)
-                    result_text = self._format_tool_result(result)
-                    logger.debug(f"[{context_id}] Tool result: {result_text[:200]}...")
-                    state.messages.append({
-                        "role": "user",
-                        "content": f"Tool `{name}` result:\n{result_text}"
-                    })
-                except Exception as e:
-                    logger.error(f"[{context_id}] Tool {name} failed: {e}")
-                    state.messages.append({
-                        "role": "user",
-                        "content": f"Tool `{name}` error: {e}"
-                    })
-
-        logger.info(f"[{context_id}] Completed task.")
+        logger.info(f"[{ctx_id}] Completed task")
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
             name="Response",
         )
 
-    async def _ensure_state(self, context_id: str, user_input: str) -> MCPContextState:
+    async def _ensure_state(self, ctx_id: str, user_input: str) -> MCPContextState:
         """Ensure MCP connection state exists for this context."""
         mcp_url = self._extract_mcp_url(user_input)
         if not mcp_url:
             raise ValueError("No MCP URL found in prompt")
 
-        state = self.ctx_id_to_state.get(context_id)
+        state = self.ctx_id_to_state.get(ctx_id)
         if state and state.url != mcp_url:
-            await self._teardown_context(context_id)
+            await self._teardown_context(ctx_id)
             state = None
 
         if not state:
@@ -166,7 +186,7 @@ class Agent:
             tools_desc = self._format_tools_description(tools_result.tools)
             tools_index = {tool.name for tool in tools_result.tools}
 
-            logger.debug(f"[{context_id}] Available tools: {tools_index}")
+            logger.debug(f"[{ctx_id}] Available tools: {tools_index}")
 
             messages = [{
                 "role": "system",
@@ -180,19 +200,19 @@ class Agent:
                 tools_index=tools_index,
                 session_id=client.session_id,
             )
-            self.ctx_id_to_state[context_id] = state
+            self.ctx_id_to_state[ctx_id] = state
 
         return state
 
-    async def _teardown_context(self, context_id: str) -> None:
+    async def _teardown_context(self, ctx_id: str) -> None:
         """Close and remove MCP connection for a context."""
-        state = self.ctx_id_to_state.pop(context_id, None)
+        state = self.ctx_id_to_state.pop(ctx_id, None)
         if state:
             try:
                 await state.client.close()
-                logger.debug(f"[{context_id}] Closed MCP connection")
+                logger.debug(f"[{ctx_id}] Closed MCP connection")
             except Exception as e:
-                logger.error(f"[{context_id}] Error closing MCP client: {e}")
+                logger.error(f"[{ctx_id}] Error closing MCP client: {e}")
 
     @staticmethod
     def _extract_mcp_url(text: str) -> Optional[str]:
@@ -206,8 +226,8 @@ class Agent:
         return None
 
     @staticmethod
-    def _parse_actions(response_text: str) -> list[dict[str, Any]]:
-        """Parse JSON actions from LLM response."""
+    def _parse_action(response_text: str) -> Optional[dict[str, Any]]:
+        """Parse single JSON action from LLM response."""
         json_str = None
 
         match = re.search(r'<json>\s*(.*?)\s*</json>', response_text, re.DOTALL)
@@ -224,10 +244,13 @@ class Agent:
 
         parsed = json.loads(json_str if json_str else response_text)
 
-        if isinstance(parsed, dict):
-            parsed = [parsed]
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else None
 
-        return [item for item in parsed if isinstance(item, dict) and "name" in item]
+        if isinstance(parsed, dict) and "name" in parsed:
+            return parsed
+
+        return None
 
     @staticmethod
     def _format_tools_description(tools) -> str:
@@ -254,16 +277,3 @@ class Agent:
             return json.dumps(result, indent=2, ensure_ascii=False)
         except Exception:
             return str(result)
-
-    def _filter_actions(self, actions: list[dict[str, Any]], valid_tools: set[str]) -> list[dict[str, Any]]:
-        """Filter actions to only include valid tools."""
-        filtered = []
-        for action in actions:
-            name = action.get("name")
-            if name == "response":
-                filtered.append({"name": "response", "kwargs": action.get("kwargs", {})})
-            elif name in valid_tools:
-                filtered.append({"name": name, "kwargs": action.get("kwargs", {})})
-            else:
-                logger.warning(f"Dropping unknown tool: {name}")
-        return filtered
