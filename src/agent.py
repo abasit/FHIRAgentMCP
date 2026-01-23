@@ -8,6 +8,7 @@ by iteratively calling tools and reasoning over results.
 import json
 import logging
 import re
+import warnings
 from typing import Any, Optional
 
 from a2a.server.tasks import TaskUpdater
@@ -17,6 +18,9 @@ from litellm import completion
 from pydantic import BaseModel, Field
 
 from mcp_client import MCPClient
+
+
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 logger = logging.getLogger("mcp_purple_agent")
 
@@ -68,14 +72,18 @@ class Agent:
         user_input = get_message_text(message)
         ctx_id = message.context_id
 
-        logger.info(f"[{ctx_id}] Received task")
-        logger.debug(f"[{ctx_id}] Input: {user_input[:500]}...")
+        # Extract task ID early for consistent logging
+        _, task_id = self._extract_mcp_url(user_input)
+        log_id = task_id or ctx_id
+
+        logger.info(f"[Task {log_id}] Received task")
+        logger.debug(f"[Task {log_id}] Input:\n{user_input[:500]}...")
 
         try:
             state = await self._ensure_state(ctx_id, user_input)
-            logger.debug(f"[{ctx_id}] Connected to MCP at {state.url}")
+            logger.debug(f"[Task {log_id}] Connected to MCP at {state.url}")
         except Exception as e:
-            logger.error(f"[{ctx_id}] Setup error: {e}")
+            logger.error(f"[Task {log_id}] Setup error: {e}")
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text=f"Error: {str(e)}"))],
                 name="Error",
@@ -86,7 +94,7 @@ class Agent:
 
         assistant_content = ""
         for i in range(MAX_ITERATIONS):
-            logger.debug(f"[{ctx_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
+            logger.debug(f"[Task {log_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
             response = completion(
                 messages=state.messages,
@@ -98,17 +106,17 @@ class Agent:
             assistant_content = response.choices[0].message.content or ""
             state.messages.append({"role": "assistant", "content": assistant_content})
 
-            logger.debug(f"[{ctx_id}] LLM response: {assistant_content[:300]}...")
+            logger.debug(f"[Task {log_id}] LLM response:\n{assistant_content}")
 
             try:
                 action = self._parse_action(assistant_content)
-                logger.debug(f"[{ctx_id}] Action: {action.get('name') if action else None}")
+                logger.debug(f"[Task {log_id}] Action: {action.get('name') if action else None}")
             except Exception as e:
-                logger.warning(f"[{ctx_id}] Failed to parse response: {e}")
+                logger.warning(f"[Task {log_id}] Failed to parse response: {e}")
                 break
 
             if not action:
-                logger.warning(f"[{ctx_id}] No action found in response")
+                logger.warning(f"[Task {log_id}] No action found in response")
                 break
 
             name = action.get("name")
@@ -116,12 +124,12 @@ class Agent:
 
             # Final response
             if name == "response":
-                logger.debug(f"[{ctx_id}] Got final response")
+                logger.debug(f"[Task {log_id}] Got final response")
                 break
 
             # Unknown tool
             if name not in state.tools_index:
-                logger.warning(f"[{ctx_id}] Unknown tool: {name}")
+                logger.warning(f"[Task {log_id}] Unknown tool: {name}")
                 state.messages.append({
                     "role": "user",
                     "content": f"Error: Unknown tool '{name}'. Available tools: {sorted(state.tools_index)}"
@@ -129,24 +137,24 @@ class Agent:
                 continue
 
             # Call tool
-            logger.debug(f"[{ctx_id}] Calling tool: {name}, args: {kwargs}")
+            logger.debug(f"[Task {log_id}] Calling tool: {name}, args: {kwargs}")
             try:
                 result = await state.client.call_tool(name, kwargs)
                 result_text = self._format_tool_result(result)
-                logger.debug(f"[{ctx_id}] Tool result: {result_text[:200]}...")
+                logger.debug(f"[Task {log_id}] Tool result:\n{result_text}")
                 state.messages.append({
                     "role": "user",
                     "content": f"Tool `{name}` result:\n{result_text}"
                 })
             except Exception as e:
-                logger.error(f"[{ctx_id}] Tool {name} failed: {e}")
+                logger.error(f"[Task {log_id}] Tool {name} failed: {e}")
                 state.messages.append({
                     "role": "user",
                     "content": f"Tool `{name}` error: {e}"
                 })
         else:
             # Max iterations reached - ask for final answer
-            logger.warning(f"[{ctx_id}] Max iterations reached, requesting final answer")
+            logger.warning(f"[Task {log_id}] Max iterations reached, requesting final answer")
             state.messages.append({
                 "role": "user",
                 "content": "You have reached the maximum number of iterations. Please provide your final answer now based on what you have learned."
@@ -160,7 +168,11 @@ class Agent:
             )
             assistant_content = response.choices[0].message.content or ""
 
-        logger.info(f"[{ctx_id}] Completed task")
+        logger.info(f"[Task {log_id}] Completed task")
+        if assistant_content:
+            logger.debug(f"[Task {log_id}] Final response: {assistant_content}")
+        else:
+            logger.warning(f"[Task {log_id}] No final response produced")
 
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
@@ -169,7 +181,7 @@ class Agent:
 
     async def _ensure_state(self, ctx_id: str, user_input: str) -> MCPContextState:
         """Ensure MCP connection state exists for this context."""
-        mcp_url = self._extract_mcp_url(user_input)
+        mcp_url, _ = self._extract_mcp_url(user_input)
         if not mcp_url:
             raise ValueError("No MCP URL found in prompt")
 
@@ -185,8 +197,6 @@ class Agent:
             tools_result = await client.list_tools()
             tools_desc = self._format_tools_description(tools_result.tools)
             tools_index = {tool.name for tool in tools_result.tools}
-
-            logger.debug(f"[{ctx_id}] Available tools: {tools_index}")
 
             messages = [{
                 "role": "system",
@@ -210,20 +220,24 @@ class Agent:
         if state:
             try:
                 await state.client.close()
-                logger.debug(f"[{ctx_id}] Closed MCP connection")
             except Exception as e:
-                logger.error(f"[{ctx_id}] Error closing MCP client: {e}")
+                pass
 
     @staticmethod
-    def _extract_mcp_url(text: str) -> Optional[str]:
-        """Extract MCP server URL from prompt text."""
+    def _extract_mcp_url(text: str) -> tuple[Optional[str], Optional[str]]:
+        """Extract MCP server URL and task ID from prompt text."""
         match = re.search(r'(?:MCP|mcp)[^:]*(?:at|available at)[:\s]+(\S+)', text)
         if match:
             url = match.group(1).strip()
             if not url.endswith('/mcp'):
                 url = url.rstrip('/') + '/mcp'
-            return url
-        return None
+
+            # Extract task ID from URL like .../tasks/{task_id}/mcp
+            task_match = re.search(r'/tasks/([^/]+)/mcp', url)
+            task_id = task_match.group(1) if task_match else None
+
+            return url, task_id
+        return None, None
 
     @staticmethod
     def _parse_action(response_text: str) -> Optional[dict[str, Any]]:
