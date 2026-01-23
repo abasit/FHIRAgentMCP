@@ -4,7 +4,7 @@ MCP-based purple agent for FHIR evaluation.
 Connects to an MCP server to access FHIR tools and answers medical questions
 by iteratively calling tools and reasoning over results.
 """
-
+import asyncio
 import json
 import logging
 import re
@@ -229,11 +229,20 @@ class Agent:
     async def _teardown_context(self, ctx_id: str) -> None:
         """Close and remove MCP connection for a context."""
         state = self.ctx_id_to_state.pop(ctx_id, None)
-        if state:
+        if not state:
+            return
+
+        # Only close if client appears healthy
+        if state.client and state.client.session:
             try:
-                await state.client.close()
-            except Exception as e:
+                await asyncio.wait_for(state.client.close(), timeout=2.0)
+            except Exception:
                 pass
+
+        # Force clear references regardless
+        if state.client:
+            state.client._stack = None
+            state.client.session = None
 
     @staticmethod
     def _extract_mcp_url(text: str) -> tuple[Optional[str], Optional[str]]:
