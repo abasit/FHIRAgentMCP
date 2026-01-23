@@ -72,23 +72,35 @@ class Agent:
         user_input = get_message_text(message)
         ctx_id = message.context_id
 
-        # Extract task ID early for consistent logging
         _, task_id = self._extract_mcp_url(user_input)
         log_id = task_id or ctx_id
 
         logger.info(f"[Task {log_id}] Received task")
-        logger.debug(f"[Task {log_id}] Input:\n{user_input[:500]}...")
+        logger.debug(f"[Task {log_id}] Input:\n{user_input}")
 
         try:
-            state = await self._ensure_state(ctx_id, user_input)
-            logger.debug(f"[Task {log_id}] Connected to MCP at {state.url}")
+            assistant_content = await self._run_task(ctx_id, log_id, user_input)
         except Exception as e:
-            logger.error(f"[Task {log_id}] Setup error: {e}")
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=f"Error: {str(e)}"))],
-                name="Error",
-            )
-            return
+            logger.exception(f"[Task {log_id}] Unhandled error: {e}")
+            assistant_content = "Failed to complete task: internal error"
+        finally:
+            await self._teardown_context(ctx_id)
+
+        logger.info(f"[Task {log_id}] Completed task")
+
+        await updater.add_artifact(
+            parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
+            name="Response",
+        )
+
+    async def _run_task(self, ctx_id: str, log_id: str, user_input: str) -> str:
+        """Execute the task and return the final response."""
+        try:
+            state = await self._ensure_state(ctx_id, user_input)
+        except Exception as e:
+            logger.error(f"[Task {log_id}] Failed to connect to MCP: {e}")
+            return "Failed to complete task: could not connect to MCP server"
+        logger.debug(f"[Task {log_id}] Connected to MCP at {state.url}")
 
         state.messages.append({"role": "user", "content": user_input})
 
@@ -96,13 +108,18 @@ class Agent:
         for i in range(MAX_ITERATIONS):
             logger.debug(f"[Task {log_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
-            response = completion(
-                messages=state.messages,
-                model=DEFAULT_MODEL,
-                temperature=0.0,
-                top_p=0,
-                seed=0,
-            )
+            try:
+                response = completion(
+                    messages=state.messages,
+                    model=DEFAULT_MODEL,
+                    temperature=0.0,
+                    top_p=0,
+                    seed=0,
+                )
+            except Exception as e:
+                logger.error(f"[Task {log_id}] LLM error: {e}")
+                return f"Failed to complete task: LLM error ({type(e).__name__})"
+
             assistant_content = response.choices[0].message.content or ""
             state.messages.append({"role": "assistant", "content": assistant_content})
 
@@ -113,11 +130,11 @@ class Agent:
                 logger.debug(f"[Task {log_id}] Action: {action.get('name') if action else None}")
             except Exception as e:
                 logger.warning(f"[Task {log_id}] Failed to parse response: {e}")
-                break
+                return "Failed to complete task: error parsing LLM response"
 
             if not action:
                 logger.warning(f"[Task {log_id}] No action found in response")
-                break
+                return "Failed to complete task: no valid action produced"
 
             name = action.get("name")
             kwargs = action.get("kwargs", {})
@@ -125,7 +142,7 @@ class Agent:
             # Final response
             if name == "response":
                 logger.debug(f"[Task {log_id}] Got final response")
-                break
+                return assistant_content
 
             # Unknown tool
             if name not in state.tools_index:
@@ -159,25 +176,20 @@ class Agent:
                 "role": "user",
                 "content": "You have reached the maximum number of iterations. Please provide your final answer now based on what you have learned."
             })
-            response = completion(
-                messages=state.messages,
-                model=DEFAULT_MODEL,
-                temperature=0.0,
-                top_p=0,
-                seed=0,
-            )
-            assistant_content = response.choices[0].message.content or ""
+            try:
+                response = completion(
+                    messages=state.messages,
+                    model=DEFAULT_MODEL,
+                    temperature=0.0,
+                    top_p=0,
+                    seed=0,
+                )
+                assistant_content = response.choices[0].message.content or ""
+            except Exception as e:
+                logger.error(f"[Task {log_id}] LLM error on final answer: {e}")
+                return f"Failed to complete task: LLM error ({type(e).__name__})"
 
-        logger.info(f"[Task {log_id}] Completed task")
-        if assistant_content:
-            logger.debug(f"[Task {log_id}] Final response: {assistant_content}")
-        else:
-            logger.warning(f"[Task {log_id}] No final response produced")
-
-        await updater.add_artifact(
-            parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
-            name="Response",
-        )
+        return assistant_content
 
     async def _ensure_state(self, ctx_id: str, user_input: str) -> MCPContextState:
         """Ensure MCP connection state exists for this context."""
