@@ -20,7 +20,7 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
 from executor import Executor
 
-logging_level = logging.INFO
+logging_level = logging.DEBUG
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("mcp_purple_agent").setLevel(logging_level)

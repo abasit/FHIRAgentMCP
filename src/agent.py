@@ -4,7 +4,6 @@ MCP-based purple agent for FHIR evaluation.
 Connects to an MCP server to access FHIR tools and answers medical questions
 by iteratively calling tools and reasoning over results.
 """
-import asyncio
 import json
 import logging
 import re
@@ -15,7 +14,6 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TextPart
 from a2a.utils import get_message_text
 from litellm import completion
-from pydantic import BaseModel, Field
 
 from mcp_client import MCPClient
 
@@ -23,6 +21,9 @@ from mcp_client import MCPClient
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 logger = logging.getLogger("mcp_purple_agent")
+
+MAX_ITERATIONS = 10
+DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 SYSTEM_PROMPT = """You are a helpful AI assistant that can complete tasks using available tools.
 
@@ -46,71 +47,62 @@ For final answer:
 IMPORTANT: Your final answer must start with 'The final answer is:'
 """
 
-MAX_ITERATIONS = 10
-DEFAULT_MODEL = "openai/gpt-4o-mini"
-
-
-class MCPContextState(BaseModel):
-    """State for an MCP connection context."""
-    model_config = {"arbitrary_types_allowed": True}
-
-    url: str
-    client: MCPClient
-    messages: list[dict[str, str]] = Field(default_factory=list)
-    tools_index: set[str] = Field(default_factory=set)
-    session_id: Optional[str] = None
-
 
 class Agent:
     """Purple agent that uses MCP tools to answer questions."""
 
-    def __init__(self):
-        self.ctx_id_to_state: dict[str, MCPContextState] = {}
-
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         """Process message and respond using MCP tools."""
         user_input = get_message_text(message)
-        ctx_id = message.context_id
-
-        _, task_id = self._extract_mcp_url(user_input)
-        log_id = task_id or ctx_id
+        mcp_url, task_id = self._extract_mcp_url(user_input)
+        log_id = task_id or message.context_id
 
         logger.info(f"[Task {log_id}] Received task")
-        logger.debug(f"[Task {log_id}] Input:\n{user_input}")
 
+        client = None
         try:
-            assistant_content = await self._run_task(ctx_id, log_id, user_input)
+            if not mcp_url:
+                raise ValueError("No MCP URL found in prompt")
+
+            client = MCPClient(mcp_url)
+            await client.connect()
+            logger.debug(f"[Task {log_id}] Connected to MCP at {mcp_url}")
+
+            result = await self._run_agent_loop(client, user_input, log_id)
+
         except Exception as e:
-            logger.exception(f"[Task {log_id}] Unhandled error: {e}")
-            assistant_content = "Failed to complete task: internal error"
+            logger.exception(f"[Task {log_id}] Error: {e}")
+            result = "Failed to complete task: Internal error."
         finally:
-            await self._teardown_context(ctx_id)
+            if client:
+                await client.close()
 
         logger.info(f"[Task {log_id}] Completed task")
 
         await updater.add_artifact(
-            parts=[Part(root=TextPart(text=assistant_content or "No response produced."))],
+            parts=[Part(root=TextPart(text=result or "No response produced."))],
             name="Response",
         )
 
-    async def _run_task(self, ctx_id: str, log_id: str, user_input: str) -> str:
-        """Execute the task and return the final response."""
-        try:
-            state = await self._ensure_state(ctx_id, user_input)
-        except Exception as e:
-            logger.error(f"[Task {log_id}] Failed to connect to MCP: {e}")
-            return "Failed to complete task: could not connect to MCP server"
-        logger.debug(f"[Task {log_id}] Connected to MCP at {state.url}")
+    async def _run_agent_loop(self, client: MCPClient, user_input: str, log_id: str) -> str:
+        """Run the agent loop: LLM -> tool calls -> repeat until done."""
+        # Get available tools
+        tools_result = await client.list_tools()
+        tools_desc = self._format_tools_description(tools_result.tools)
+        tools_index = {tool.name for tool in tools_result.tools}
 
-        state.messages.append({"role": "user", "content": user_input})
+        messages = [
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\nAvailable MCP tools:\n{tools_desc}\n"},
+            {"role": "user", "content": user_input},
+        ]
 
-        assistant_content = ""
         for i in range(MAX_ITERATIONS):
             logger.debug(f"[Task {log_id}] Iteration {i + 1}/{MAX_ITERATIONS}")
 
+            # Call LLM
             try:
                 response = completion(
-                    messages=state.messages,
+                    messages=messages,
                     model=DEFAULT_MODEL,
                     temperature=0.0,
                     top_p=0,
@@ -118,23 +110,23 @@ class Agent:
                 )
             except Exception as e:
                 logger.error(f"[Task {log_id}] LLM error: {e}")
-                return f"Failed to complete task: LLM error ({type(e).__name__})"
+                return "Failed to complete task: Internal error."
 
             assistant_content = response.choices[0].message.content or ""
-            state.messages.append({"role": "assistant", "content": assistant_content})
-
+            messages.append({"role": "assistant", "content": assistant_content})
             logger.debug(f"[Task {log_id}] LLM response:\n{assistant_content}")
 
+            # Parse action
             try:
                 action = self._parse_action(assistant_content)
                 logger.debug(f"[Task {log_id}] Action: {action.get('name') if action else None}")
             except Exception as e:
                 logger.warning(f"[Task {log_id}] Failed to parse response: {e}")
-                return "Failed to complete task: error parsing LLM response"
+                return "Failed to complete task: Internal error."
 
             if not action:
                 logger.warning(f"[Task {log_id}] No action found in response")
-                return "Failed to complete task: no valid action produced"
+                return "Failed to complete task: Internal error."
 
             name = action.get("name")
             kwargs = action.get("kwargs", {})
@@ -145,104 +137,50 @@ class Agent:
                 return assistant_content
 
             # Unknown tool
-            if name not in state.tools_index:
+            if name not in tools_index:
                 logger.warning(f"[Task {log_id}] Unknown tool: {name}")
-                state.messages.append({
+                messages.append({
                     "role": "user",
-                    "content": f"Error: Unknown tool '{name}'. Available tools: {sorted(state.tools_index)}"
+                    "content": f"Error: Unknown tool '{name}'. Available tools: {sorted(tools_index)}"
                 })
                 continue
 
             # Call tool
             logger.debug(f"[Task {log_id}] Calling tool: {name}, args: {kwargs}")
             try:
-                result = await state.client.call_tool(name, kwargs)
+                result = await client.call_tool(name, kwargs)
                 result_text = self._format_tool_result(result)
                 logger.debug(f"[Task {log_id}] Tool result:\n{result_text}")
-                state.messages.append({
+                messages.append({
                     "role": "user",
                     "content": f"Tool `{name}` result:\n{result_text}"
                 })
             except Exception as e:
                 logger.error(f"[Task {log_id}] Tool {name} failed: {e}")
-                state.messages.append({
+                messages.append({
                     "role": "user",
                     "content": f"Tool `{name}` error: {e}"
                 })
-        else:
-            # Max iterations reached - ask for final answer
-            logger.warning(f"[Task {log_id}] Max iterations reached, requesting final answer")
-            state.messages.append({
-                "role": "user",
-                "content": "You have reached the maximum number of iterations. Please provide your final answer now based on what you have learned."
-            })
-            try:
-                response = completion(
-                    messages=state.messages,
-                    model=DEFAULT_MODEL,
-                    temperature=0.0,
-                    top_p=0,
-                    seed=0,
-                )
-                assistant_content = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error(f"[Task {log_id}] LLM error on final answer: {e}")
-                return f"Failed to complete task: LLM error ({type(e).__name__})"
 
-        return assistant_content
+        # Max iterations - force final answer
+        logger.warning(f"[Task {log_id}] Max iterations reached, requesting final answer")
+        messages.append({
+            "role": "user",
+            "content": "You have reached the maximum number of iterations. Please provide your final answer now."
+        })
 
-    async def _ensure_state(self, ctx_id: str, user_input: str) -> MCPContextState:
-        """Ensure MCP connection state exists for this context."""
-        mcp_url, _ = self._extract_mcp_url(user_input)
-        if not mcp_url:
-            raise ValueError("No MCP URL found in prompt")
-
-        state = self.ctx_id_to_state.get(ctx_id)
-        if state and state.url != mcp_url:
-            await self._teardown_context(ctx_id)
-            state = None
-
-        if not state:
-            client = MCPClient(mcp_url)
-            await client.connect()
-
-            tools_result = await client.list_tools()
-            tools_desc = self._format_tools_description(tools_result.tools)
-            tools_index = {tool.name for tool in tools_result.tools}
-
-            messages = [{
-                "role": "system",
-                "content": f"{SYSTEM_PROMPT}\nAvailable MCP tools:\n{tools_desc}\n",
-            }]
-
-            state = MCPContextState(
-                url=mcp_url,
-                client=client,
+        try:
+            response = completion(
                 messages=messages,
-                tools_index=tools_index,
-                session_id=client.session_id,
+                model=DEFAULT_MODEL,
+                temperature=0.0,
+                top_p=0,
+                seed=0,
             )
-            self.ctx_id_to_state[ctx_id] = state
-
-        return state
-
-    async def _teardown_context(self, ctx_id: str) -> None:
-        """Close and remove MCP connection for a context."""
-        state = self.ctx_id_to_state.pop(ctx_id, None)
-        if not state:
-            return
-
-        # Only close if client appears healthy
-        if state.client and state.client.session:
-            try:
-                await asyncio.wait_for(state.client.close(), timeout=2.0)
-            except Exception:
-                pass
-
-        # Force clear references regardless
-        if state.client:
-            state.client._stack = None
-            state.client.session = None
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            logger.error(f"[Task {log_id}] LLM error on final answer: {e}")
+            return f"Failed to complete task: Internal error."
 
     @staticmethod
     def _extract_mcp_url(text: str) -> tuple[Optional[str], Optional[str]]:

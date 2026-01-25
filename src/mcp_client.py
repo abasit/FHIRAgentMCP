@@ -1,13 +1,10 @@
 """
 MCP client wrapper for connecting to MCP servers.
-
-Provides a simple interface for connecting to MCP servers, listing tools,
-and calling tools with proper lifecycle management.
 """
 
 import logging
 from contextlib import AsyncExitStack
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from mcp import ClientSession
@@ -23,27 +20,23 @@ class MCPClient:
         self.url = url
         self._stack: Optional[AsyncExitStack] = None
         self.session: Optional[ClientSession] = None
-        self._get_session_id = None
 
     async def connect(self) -> ClientSession:
         """Connect to the MCP server and initialize session."""
-        if self.session:
-            return self.session
-
         logger.debug(f"Connecting to MCP server at {self.url}")
         self._stack = AsyncExitStack()
 
         try:
-            read, write, get_session_id = await self._stack.enter_async_context(
+            read, write, _ = await self._stack.enter_async_context(
                 streamable_http_client(self.url)
             )
-            self._get_session_id = get_session_id
             self.session = await self._stack.enter_async_context(ClientSession(read, write))
             await self.session.initialize()
-            logger.debug(f"Connected to MCP server, session_id={self.session_id}")
+            logger.debug(f"Connected to MCP server")
             return self.session
 
         except BaseExceptionGroup as eg:
+            await self.close()
             for e in eg.exceptions:
                 if isinstance(e, httpx.HTTPStatusError):
                     raise ConnectionError(
@@ -58,13 +51,12 @@ class MCPClient:
     async def close(self) -> None:
         """Close the MCP connection and cleanup resources."""
         if self._stack:
-            logger.debug(f"Closing MCP connection to {self.url}")
             try:
                 await self._stack.aclose()
-            finally:
-                self._stack = None
-                self.session = None
-                self._get_session_id = None
+            except Exception:
+                pass
+        self._stack = None
+        self.session = None
 
     async def list_tools(self):
         """List available tools from the MCP server."""
@@ -77,8 +69,3 @@ class MCPClient:
         if not self.session:
             raise RuntimeError("MCPClient not connected")
         return await self.session.call_tool(tool_name, kwargs)
-
-    @property
-    def session_id(self) -> Optional[str]:
-        """Get the current session ID."""
-        return self._get_session_id() if self._get_session_id else None
