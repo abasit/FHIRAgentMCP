@@ -19,6 +19,7 @@ from mcp_client import MCPClient
 
 
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.CRITICAL)
 
 logger = logging.getLogger("mcp_purple_agent")
 
@@ -48,6 +49,11 @@ IMPORTANT: Your final answer must start with 'The final answer is:'
 """
 
 
+class MCPServerError(Exception):
+    """Raised when MCP server fails during tool operations."""
+    pass
+
+
 class Agent:
     """Purple agent that uses MCP tools to answer questions."""
 
@@ -70,6 +76,12 @@ class Agent:
 
             result = await self._run_agent_loop(client, user_input, log_id)
 
+        except ConnectionError as e:
+            logger.error(f"[Task {log_id}] MCP connection error: {e}")
+            result = f"Failed to complete task: {e}"
+        except MCPServerError as e:
+            logger.error(f"[Task {log_id}] MCP server error: {e}")
+            result = "Failed to complete task: MCP server error"
         except Exception as e:
             logger.exception(f"[Task {log_id}] Error: {e}")
             result = "Failed to complete task: Internal error."
@@ -87,7 +99,11 @@ class Agent:
     async def _run_agent_loop(self, client: MCPClient, user_input: str, log_id: str) -> str:
         """Run the agent loop: LLM -> tool calls -> repeat until done."""
         # Get available tools
-        tools_result = await client.list_tools()
+        try:
+            tools_result = await client.list_tools()
+        except Exception as e:
+            raise MCPServerError(f"list_tools failed: {e}") from e
+
         tools_desc = self._format_tools_description(tools_result.tools)
         tools_index = {tool.name for tool in tools_result.tools}
 
@@ -156,11 +172,7 @@ class Agent:
                     "content": f"Tool `{name}` result:\n{result_text}"
                 })
             except Exception as e:
-                logger.error(f"[Task {log_id}] Tool {name} failed: {e}")
-                messages.append({
-                    "role": "user",
-                    "content": f"Tool `{name}` error: {e}"
-                })
+                raise MCPServerError(f"call_tool '{name}' failed: {e}") from e
 
         # Max iterations - force final answer
         logger.warning(f"[Task {log_id}] Max iterations reached, requesting final answer")
@@ -180,7 +192,7 @@ class Agent:
             return response.choices[0].message.content or ""
         except Exception as e:
             logger.error(f"[Task {log_id}] LLM error on final answer: {e}")
-            return f"Failed to complete task: Internal error."
+            return "Failed to complete task: Internal error."
 
     @staticmethod
     def _extract_mcp_url(text: str) -> tuple[Optional[str], Optional[str]]:
