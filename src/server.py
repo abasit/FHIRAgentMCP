@@ -22,7 +22,11 @@ from executor import Executor
 
 logging_level = logging.DEBUG
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s',
+    datefmt='%H:%M:%S'
+)
 logging.getLogger("mcp_purple_agent").setLevel(logging_level)
 
 logger = logging.getLogger("mcp_purple_agent")
