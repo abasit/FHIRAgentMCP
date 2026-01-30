@@ -122,7 +122,6 @@ class Agent:
                     messages=messages,
                     model=DEFAULT_MODEL,
                     temperature=0.0,
-                    top_p=0,
                     seed=0,
                 )
             except Exception as e:

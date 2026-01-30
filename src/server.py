@@ -20,7 +20,7 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
 from executor import Executor
 
-logging_level = logging.DEBUG
+logging_level = logging.INFO
 
 logging.basicConfig(
     level=logging.WARNING,
