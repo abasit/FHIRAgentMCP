@@ -29,6 +29,7 @@ DEFAULT_MODEL = "openai/gpt-4o-mini"
 SYSTEM_PROMPT = """You are a helpful AI assistant that can complete tasks using available tools.
 
 Use the available MCP tools to retrieve information before answering.
+You may only call one tool at a time.
 Provide clear, accurate answers based on the data you retrieve.
 If you cannot find information, state this clearly rather than guessing.
 Do not repeat the same action multiple times.
